@@ -472,7 +472,7 @@ class KSVideo(KSBaseUploader):
                 await page.keyboard.type(f"#{tag} ")
                 await asyncio.sleep(2)
 
-            max_retries = 60
+            max_retries = 300  # 2s/次 → 上限约 10 分钟，给大文件（数百 MB）留足上传时间，避免没传完就去发布
             retry_count = 0
             while retry_count < max_retries:
                 try:
@@ -508,6 +508,20 @@ class KSVideo(KSBaseUploader):
                         await publish_button.click()
 
                     await asyncio.sleep(1)
+
+                    # 视频还没传完就点发布时，快手会弹「请在视频上传完成后再点击发布」。
+                    # 关掉提示、稍等让上传继续，下一轮再发，而不是空点导致卡住、需要人工干预。
+                    upload_tip = page.get_by_text("请在视频上传完成后再点击发布")
+                    if await upload_tip.count() > 0:
+                        kuaishou_logger.info(_msg("⏳", "视频还在上传，关掉提示再等一会"))
+                        ack = page.get_by_role("button", name="确认", exact=True)
+                        if not await ack.count():
+                            ack = page.get_by_text("确认", exact=True)
+                        if await ack.count() > 0:
+                            await ack.first.click()
+                        await asyncio.sleep(3)
+                        continue
+
                     confirm_button = page.get_by_text("确认发布")
                     if await confirm_button.count() > 0:
                         await confirm_button.click()
