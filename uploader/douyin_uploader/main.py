@@ -383,9 +383,14 @@ class DouYinBaseUploader(BaseVideoUploader):
             dialog = page.locator(".semi-modal-content").filter(has_text="对作品内容添加声明").first
             await dialog.wait_for(state="visible", timeout=6000)
 
-            # 单选项，如「内容为个人观点或见解」；exact 避免误命中预览里的「作者声明：…」
-            await dialog.get_by_text(declaration, exact=True).first.click()
-            await dialog.get_by_role("button", name="确定").click()
+            # 单选项：Semi 的文字是 .semi-radio-addon（常带 pointer-events:none，直接点会卡 30s 超时），
+            # 要点可交互的 .semi-radio 外层；找不到外层再退回 force 强制点文字。exact 避免误命中预览「作者声明：…」。
+            option = dialog.locator(".semi-radio").filter(has_text=declaration).first
+            if await option.count():
+                await option.click(timeout=6000)
+            else:
+                await dialog.get_by_text(declaration, exact=True).first.click(timeout=6000, force=True)
+            await dialog.get_by_role("button", name="确定").click(timeout=6000)
             await dialog.wait_for(state="hidden", timeout=6000)
             douyin_logger.info(_msg("🧾", f"自主声明已选择「{declaration}」"))
         except Exception as exc:
