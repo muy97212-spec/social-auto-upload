@@ -107,6 +107,7 @@ sau skill install
 ## Development Conventions
 
 *   The backend code is located in the root directory and the `myUtils` and `uploader` directories.
+*   Two Xiaohongshu directories with different roles (don't edit the wrong one): `uploader/xhs_uploader/` only provides the `sign_local` signing helper (used by `myUtils/auth.py`); the actual publishing flow lives in `uploader/xiaohongshu_uploader/` (Playwright).
 *   The frontend code is located in the `sau_frontend` directory.
 *   The project uses a SQLite database for data storage. The database file is located at `db/database.db`.
 *   The `conf.example.py` file should be copied to `conf.py` and configured with the appropriate settings.

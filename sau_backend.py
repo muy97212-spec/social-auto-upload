@@ -12,9 +12,11 @@ from flask import Flask, request, jsonify, Response, render_template, send_from_
 from conf import BASE_DIR
 from myUtils.login import get_tencent_cookie, douyin_cookie_gen, get_ks_cookie, xiaohongshu_cookie_gen
 from myUtils.postVideo import post_video_tencent, post_video_DouYin, post_video_ks, post_video_xhs
+from utils.log import create_logger
 
 active_queues = {}
 app = Flask(__name__)
+sau_logger = create_logger('sau_backend', 'logs/sau_backend.log')
 
 #允许所有来源跨域访问
 CORS(app)
@@ -24,6 +26,15 @@ app.config['MAX_CONTENT_LENGTH'] = 160 * 1024 * 1024
 
 # 获取当前目录（假设 index.html 和 assets 在这里）
 current_dir = os.path.dirname(os.path.abspath(__file__))
+
+
+def _safe_basename(name: str) -> str:
+    """剥掉任何目录成分，防止上传文件名里的 ../ 或路径分隔符穿越出 videoFile。
+    故意保留中文等非 ASCII 字符（不用 secure_filename，否则中文名会被清空）。"""
+    base = os.path.basename((name or "").replace("\\", "/")).strip()
+    if not base or set(base) <= {"."}:  # "" / "." / ".." 等纯目录引用
+        return "file"
+    return base
 
 # 处理所有静态资源请求（未来打包用）
 @app.route('/assets/<filename>')
@@ -62,10 +73,11 @@ def upload_file():
     try:
         # 保存文件到指定位置
         uuid_v1 = uuid.uuid1()
-        print(f"UUID v1: {uuid_v1}")
-        filepath = Path(BASE_DIR / "videoFile" / f"{uuid_v1}_{file.filename}")
+        sau_logger.debug(f"UUID v1: {uuid_v1}")
+        safe_name = _safe_basename(file.filename)
+        filepath = Path(BASE_DIR / "videoFile" / f"{uuid_v1}_{safe_name}")
         file.save(filepath)
-        return jsonify({"code":200,"msg": "File uploaded successfully", "data": f"{uuid_v1}_{file.filename}"}), 200
+        return jsonify({"code":200,"msg": "File uploaded successfully", "data": f"{uuid_v1}_{safe_name}"}), 200
     except Exception as e:
         return jsonify({"code":500,"msg": str(e),"data":None}), 500
 
@@ -111,11 +123,12 @@ def upload_save():
         filename = custom_filename + "." + file.filename.split('.')[-1]
     else:
         filename = file.filename
+    filename = _safe_basename(filename)  # 防路径穿越，保留中文名
 
     try:
         # 生成 UUID v1
         uuid_v1 = uuid.uuid1()
-        print(f"UUID v1: {uuid_v1}")
+        sau_logger.debug(f"UUID v1: {uuid_v1}")
 
         # 构造文件名和路径
         final_filename = f"{uuid_v1}_{filename}"
@@ -131,7 +144,7 @@ def upload_save():
             VALUES (?, ?, ?)
                                 ''', (filename, round(float(os.path.getsize(filepath)) / (1024 * 1024),2), final_filename))
             conn.commit()
-            print("✅ 上传文件已记录")
+            sau_logger.info("✅ 上传文件已记录")
 
         return jsonify({
             "code": 200,
@@ -143,7 +156,7 @@ def upload_save():
         }), 200
 
     except Exception as e:
-        print(f"Upload failed: {e}")
+        sau_logger.error(f"Upload failed: {e}")
         return jsonify({
             "code": 500,
             "msg": f"upload failed: {e}",
@@ -202,9 +215,9 @@ def getAccounts():
             rows = cursor.fetchall()
             rows_list = [list(row) for row in rows]
 
-            print("\n📋 当前数据表内容（快速获取）：")
+            sau_logger.debug("\n📋 当前数据表内容（快速获取）：")
             for row in rows:
-                print(row)
+                sau_logger.debug(f"{row}")
 
             return jsonify(
                 {
@@ -213,7 +226,7 @@ def getAccounts():
                     "data": rows_list
                 }), 200
     except Exception as e:
-        print(f"获取账号列表时出错: {str(e)}")
+        sau_logger.error(f"获取账号列表时出错: {str(e)}")
         return jsonify({
             "code": 500,
             "msg": f"获取账号列表失败: {str(e)}",
@@ -229,9 +242,9 @@ async def getValidAccounts():
         SELECT * FROM user_info''')
         rows = cursor.fetchall()
         rows_list = [list(row) for row in rows]
-        print("\n📋 当前数据表内容：")
+        sau_logger.debug("\n📋 当前数据表内容：")
         for row in rows:
-            print(row)
+            sau_logger.debug(f"{row}")
         for row in rows_list:
             flag = await check_cookie(row[1],row[2])
             if not flag:
@@ -242,9 +255,9 @@ async def getValidAccounts():
                 WHERE id = ?
                 ''', (0,row[0]))
                 conn.commit()
-                print("✅ 用户状态已更新")
+                sau_logger.info("✅ 用户状态已更新")
         for row in rows:
-            print(row)
+            sau_logger.debug(f"{row}")
         return jsonify(
                         {
                             "code": 200,
@@ -287,12 +300,12 @@ def delete_file():
             if file_path.exists():
                 try:
                     file_path.unlink()  # 删除文件
-                    print(f"✅ 实际文件已删除: {file_path}")
+                    sau_logger.info(f"✅ 实际文件已删除: {file_path}")
                 except Exception as e:
-                    print(f"⚠️ 删除实际文件失败: {e}")
+                    sau_logger.error(f"⚠️ 删除实际文件失败: {e}")
                     # 即使删除文件失败，也要继续删除数据库记录，避免数据不一致
             else:
-                print(f"⚠️ 实际文件不存在: {file_path}")
+                sau_logger.warning(f"⚠️ 实际文件不存在: {file_path}")
 
             # 删除数据库记录
             cursor.execute("DELETE FROM file_records WHERE id = ?", (file_id,))
@@ -352,9 +365,9 @@ def delete_account():
                 if cookie_file_path.exists():
                     try:
                         cookie_file_path.unlink()
-                        print(f"✅ Cookie文件已删除: {cookie_file_path}")
+                        sau_logger.info(f"✅ Cookie文件已删除: {cookie_file_path}")
                     except Exception as e:
-                        print(f"⚠️ 删除Cookie文件失败: {e}")
+                        sau_logger.error(f"⚠️ 删除Cookie文件失败: {e}")
 
             # 删除数据库记录
             cursor.execute("DELETE FROM user_info WHERE id = ?", (account_id,))
@@ -387,7 +400,7 @@ def login():
     active_queues[id] = status_queue
 
     def on_close():
-        print(f"清理队列: {id}")
+        sau_logger.debug(f"清理队列: {id}")
         del active_queues[id]
     # 启动异步任务线程
     thread = threading.Thread(target=run_async_function, args=(type,id,status_queue), daemon=True)
@@ -437,8 +450,8 @@ def postVideo():
         return jsonify({"code": 400, "msg": "标题不能为空", "data": None}), 400
 
     # 打印获取到的数据（仅作为示例）
-    print("File List:", file_list)
-    print("Account List:", account_list)
+    sau_logger.debug(f"File List: {file_list}")
+    sau_logger.debug(f"Account List: {account_list}")
 
     try:
         match type:
@@ -465,7 +478,7 @@ def postVideo():
                 "data": None
             }), 200
     except Exception as e:
-        print(f"发布视频时出错: {str(e)}")
+        sau_logger.error(f"发布视频时出错: {str(e)}")
         return jsonify({
             "code": 500,
             "msg": f"发布失败: {str(e)}",
@@ -535,8 +548,8 @@ def postVideoBatch():
         daily_times = data.get('dailyTimes')
         start_days = data.get('startDays')
         # 打印获取到的数据（仅作为示例）
-        print("File List:", file_list)
-        print("Account List:", account_list)
+        sau_logger.debug(f"File List: {file_list}")
+        sau_logger.debug(f"Account List: {account_list}")
         match type:
             case 1:
                 post_video_xhs(title, file_list, tags, account_list, category, enableTimer, videos_per_day, daily_times,
@@ -625,7 +638,7 @@ def upload_cookie():
         }), 200
 
     except Exception as e:
-        print(f"上传Cookie文件时出错: {str(e)}")
+        sau_logger.error(f"上传Cookie文件时出错: {str(e)}")
         return jsonify({
             "code": 500,
             "msg": f"上传Cookie文件失败: {str(e)}",
@@ -671,7 +684,7 @@ def download_cookie():
         )
 
     except Exception as e:
-        print(f"下载Cookie文件时出错: {str(e)}")
+        sau_logger.error(f"下载Cookie文件时出错: {str(e)}")
         return jsonify({
             "code": 500,
             "msg": f"下载Cookie文件失败: {str(e)}",

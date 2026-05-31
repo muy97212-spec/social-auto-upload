@@ -189,3 +189,7 @@ uploadFile
 videoFile
 
 /uploader/bilibili_uploader/qrcode.png
+
+# 运行期调试产物（视频号声明原创诊断截图、登录二维码等）
+/debug_*.png
+/qrcode.png
