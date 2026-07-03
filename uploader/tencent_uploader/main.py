@@ -23,6 +23,10 @@ TENCENT_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 TENCENT_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 
 
+def _is_tencent_authenticated_url(url: str) -> bool:
+    return url.startswith(TENCENT_UPLOAD_URL) or url.startswith(TENCENT_MANAGE_URL)
+
+
 def _msg(emoji: str, text: str) -> str:
     return f"{emoji} {text}"
 
@@ -111,14 +115,22 @@ async def cookie_auth(account_file):
             context = await browser.new_context(storage_state=account_file)
             context = await set_init_script(context)
             page = await context.new_page()
-            await page.goto(TENCENT_UPLOAD_URL)
-            await page.wait_for_url(TENCENT_UPLOAD_URL, timeout=5000)
+            await page.goto(TENCENT_UPLOAD_URL, wait_until="domcontentloaded")
+            try:
+                await page.wait_for_url(TENCENT_UPLOAD_URL, timeout=5000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(1500)
 
             login_markers = [
                 page.get_by_text("扫码登录", exact=True).first,
                 page.get_by_text("发表视频", exact=True).first,
                 page.get_by_role("button", name="发表").first,
             ]
+
+            if not _is_tencent_authenticated_url(page.url):
+                tencent_logger.info(_msg("🥹", f"cookie 已失效，当前页面: {page.url}"))
+                return False
 
             if await login_markers[0].count():
                 tencent_logger.info(_msg("🥹", "cookie 已失效，得重新登录一下"))
@@ -258,6 +270,37 @@ async def _is_tencent_qrcode_scanned(page: Page) -> bool:
         except Exception:
             continue
     return False
+
+
+async def _click_tencent_publish_button(page: Page) -> bool:
+    publish_button = page.locator('div.form-btns button:has-text("发表")')
+    if not await publish_button.count():
+        return False
+
+    try:
+        await publish_button.click()
+    except Exception as exc:
+        if "intercepts pointer events" not in str(exc):
+            raise
+        tencent_logger.warning(_msg("🧭", "发表按钮被页面浮层遮挡，改用强制点击兜底"))
+        await publish_button.click(force=True)
+    return True
+
+
+async def _set_tencent_video_file(page: Page, file_path: str) -> None:
+    for attempt in range(2):
+        try:
+            file_input = page.locator('input[type="file"]').first
+            await file_input.wait_for(state="attached", timeout=30000)
+            await file_input.set_input_files(file_path)
+            return
+        except Exception as exc:
+            is_last_attempt = attempt == 1
+            if is_last_attempt:
+                raise
+            tencent_logger.warning(_msg("🧭", f"视频号上传入口暂时没出现，刷新上传页后重试: {exc}"))
+            await page.reload(wait_until="domcontentloaded")
+            await page.wait_for_url(TENCENT_UPLOAD_URL, timeout=30000)
 
 
 async def _refresh_tencent_qrcode(page: Page) -> None:
@@ -495,12 +538,14 @@ class TencentBaseUploader(BaseVideoUploader):
         await page.locator("div.input-editor").click()
 
     async def open_upload_page(self, page: Page) -> None:
-        await page.goto(TENCENT_UPLOAD_URL)
-        await page.wait_for_url(TENCENT_UPLOAD_URL)
+        await page.goto(TENCENT_UPLOAD_URL, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
+        if not _is_tencent_authenticated_url(page.url):
+            raise RuntimeError(f"视频号登录态已失效或被打回登录页: {page.url}")
+        await page.wait_for_url(TENCENT_UPLOAD_URL, timeout=30000)
 
     async def upload_video_file(self, page: Page, file_path: str) -> None:
-        file_input = page.locator('input[type="file"]')
-        await file_input.set_input_files(file_path)
+        await _set_tencent_video_file(page, file_path)
 
     async def set_short_title(self, page: Page, title: str, short_title: str | None = None) -> None:
         short_title_element = (
@@ -666,9 +711,7 @@ class TencentBaseUploader(BaseVideoUploader):
                     await page.wait_for_url("**/post/list**", timeout=5000)
                     tencent_logger.success(_msg("🥳", "视频草稿保存成功"))
                 else:
-                    publish_button = page.locator('div.form-btns button:has-text("发表")')
-                    if await publish_button.count():
-                        await publish_button.click()
+                    await _click_tencent_publish_button(page)
                     await page.wait_for_url(TENCENT_MANAGE_URL, timeout=5000)
                     tencent_logger.success(_msg("🥳", "视频发布成功"))
                 break
