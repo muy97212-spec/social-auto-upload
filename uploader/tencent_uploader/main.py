@@ -17,6 +17,7 @@ from utils.base_social_media import set_init_script
 from utils.log import tencent_logger
 
 TENCENT_LOGIN_URL = "https://channels.weixin.qq.com"
+TENCENT_PLATFORM_URL = "https://channels.weixin.qq.com/platform"
 TENCENT_UPLOAD_URL = "https://channels.weixin.qq.com/platform/post/create"
 TENCENT_MANAGE_URL = "https://channels.weixin.qq.com/platform/post/list"
 TENCENT_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
@@ -24,7 +25,7 @@ TENCENT_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 
 
 def _is_tencent_authenticated_url(url: str) -> bool:
-    return url.startswith(TENCENT_UPLOAD_URL) or url.startswith(TENCENT_MANAGE_URL)
+    return url.startswith(TENCENT_PLATFORM_URL)
 
 
 def _msg(emoji: str, text: str) -> str:
@@ -177,13 +178,45 @@ async def _extract_tencent_qrcode_src(page: Page) -> str:
     raise RuntimeError("未获取到视频号登录二维码地址")
 
 
+async def _screenshot_tencent_qrcode(page: Page, account_file: str) -> Path | None:
+    """抠不到 data:image 二维码时的兜底：把页面上二维码那块直接截图存下来。"""
+    qrcode_utils = _get_qrcode_utils()
+    output_path = qrcode_utils["build_login_qrcode_path"](account_file, suffix="tencent_login_qrcode")
+    for selector in ("div.login-qrcode-wrap", "div.qrcode-wrap", "img.qrcode"):
+        locator = page.locator(selector).first
+        try:
+            if not await locator.count() or not await locator.is_visible():
+                continue
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            await locator.screenshot(path=str(output_path))
+            return output_path
+        except Exception:
+            continue
+    return None
+
+
 async def _save_tencent_qrcode(page: Page, account_file: str, previous_qrcode_path: Path | None = None, qrcode_callback=None) -> dict:
     qrcode_utils = _get_qrcode_utils()
-    qrcode_src = await _extract_tencent_qrcode_src(page)
-    qrcode_path = qrcode_utils["save_data_url_image"](
-        qrcode_src,
-        qrcode_utils["build_login_qrcode_path"](account_file, suffix="tencent_login_qrcode"),
-    )
+    qrcode_src: str | None = None
+    qrcode_path: Path | None = None
+    try:
+        qrcode_src = await _extract_tencent_qrcode_src(page)
+        qrcode_path = qrcode_utils["save_data_url_image"](
+            qrcode_src,
+            qrcode_utils["build_login_qrcode_path"](account_file, suffix="tencent_login_qrcode"),
+        )
+    except Exception as exc:
+        # 页面改版 / 二维码不是 data:image 时别直接失败——浏览器还开着，人可以自己扫。
+        tencent_logger.warning(_msg("😵", f"没抠到二维码图片（{exc}），改用截图兜底"))
+        qrcode_src = None
+        qrcode_path = await _screenshot_tencent_qrcode(page, account_file)
+
+    if qrcode_path is None:
+        tencent_logger.warning(_msg("🧍", "二维码存不下来，请直接在弹出的 Chrome 窗口里扫码"))
+        qrcode_info = {"image_path": "", "image_data_url": ""}
+        await _emit_qrcode_callback(qrcode_callback, qrcode_info)
+        return qrcode_info
+
     if previous_qrcode_path and previous_qrcode_path != qrcode_path:
         if qrcode_utils["remove_qrcode_file"](previous_qrcode_path):
             tencent_logger.info(_msg("🧹", f"临时二维码文件已清理: {previous_qrcode_path}"))
@@ -202,7 +235,7 @@ async def _save_tencent_qrcode(page: Page, account_file: str, previous_qrcode_pa
 
     qrcode_info = {
         "image_path": str(qrcode_path),
-        "image_data_url": qrcode_src,
+        "image_data_url": qrcode_src or "",
     }
     await _emit_qrcode_callback(qrcode_callback, qrcode_info)
     return qrcode_info
@@ -354,7 +387,7 @@ async def _wait_for_tencent_login(
     poll_interval: int = 3,
     max_checks: int = 100,
 ) -> dict:
-    qrcode_path = Path(qrcode_info["image_path"])
+    qrcode_path = Path(qrcode_info["image_path"]) if qrcode_info.get("image_path") else None
     scanned_logged = False
     for _ in range(max_checks):
         if await _is_tencent_login_completed(page):
@@ -369,13 +402,17 @@ async def _wait_for_tencent_login(
             tencent_logger.warning(_msg("😵", "二维码失效了，小人马上去刷新"))
             await _refresh_tencent_qrcode(page)
             await asyncio.sleep(1)
-            qrcode_info = await _save_tencent_qrcode(
-                page,
-                account_file,
-                previous_qrcode_path=qrcode_path,
-                qrcode_callback=qrcode_callback,
-            )
-            qrcode_path = Path(qrcode_info["image_path"])
+            try:
+                qrcode_info = await _save_tencent_qrcode(
+                    page,
+                    account_file,
+                    previous_qrcode_path=qrcode_path,
+                    qrcode_callback=qrcode_callback,
+                )
+                qrcode_path = Path(qrcode_info["image_path"]) if qrcode_info.get("image_path") else None
+            except Exception as exc:
+                # 刷新失败也别退出：窗口还开着，人可以直接在页面上点刷新再扫。
+                tencent_logger.warning(_msg("😵", f"重存二维码失败（{exc}），请直接在 Chrome 窗口里点刷新再扫"))
 
         await asyncio.sleep(poll_interval)
 
@@ -399,10 +436,17 @@ async def tencent_cookie_gen(
         result = _build_login_result(False, "failed", "视频号登录失败", account_file)
         try:
             page = await context.new_page()
-            await page.goto(TENCENT_LOGIN_URL)
-            qrcode_info = await _save_tencent_qrcode(page, account_file, qrcode_callback=qrcode_callback)
-            qrcode_path = Path(qrcode_info["image_path"])
-            tencent_logger.info(_msg("🧍", "请扫码，小人正在耐心等待登录完成"))
+            # 走发布页而不是首页：没登录会被重定向到 login.html 出二维码，
+            # 已经是登录态则直接停在发布页，下面的等待循环会立刻判定成功、省掉一次扫码。
+            await page.goto(TENCENT_UPLOAD_URL, wait_until="domcontentloaded")
+            await page.wait_for_timeout(3000)
+            if await _is_tencent_login_completed(page):
+                tencent_logger.info(_msg("🥳", "浏览器里本来就是登录态，不用扫码"))
+                qrcode_info = {"image_path": "", "image_data_url": ""}
+            else:
+                qrcode_info = await _save_tencent_qrcode(page, account_file, qrcode_callback=qrcode_callback)
+                tencent_logger.info(_msg("🧍", "请扫码，小人正在耐心等待登录完成"))
+            qrcode_path = Path(qrcode_info["image_path"]) if qrcode_info.get("image_path") else None
             result = await _wait_for_tencent_login(
                 page,
                 account_file,
@@ -501,10 +545,11 @@ class TencentBaseUploader(BaseVideoUploader):
         self.local_executable_path = LOCAL_CHROME_PATH
 
     async def validate_base_args(self):
-        if not os.path.exists(self.account_file):
-            raise RuntimeError(f"cookie文件不存在，请先完成视频号登录: {self.account_file}")
-        if not await cookie_auth(self.account_file):
-            raise RuntimeError(f"cookie文件已失效，请先完成视频号登录: {self.account_file}")
+        if self.headless:
+            if not os.path.exists(self.account_file):
+                raise RuntimeError(f"cookie文件不存在，请先完成视频号登录: {self.account_file}")
+            if not await cookie_auth(self.account_file):
+                raise RuntimeError(f"cookie文件已失效，请先完成视频号登录: {self.account_file}")
         if self.publish_strategy not in {TENCENT_PUBLISH_STRATEGY_IMMEDIATE, TENCENT_PUBLISH_STRATEGY_SCHEDULED}:
             raise ValueError(f"不支持的发布策略: {self.publish_strategy}")
 
@@ -537,12 +582,30 @@ class TencentBaseUploader(BaseVideoUploader):
         await page.keyboard.type(publish_date.strftime("%H"))
         await page.locator("div.input-editor").click()
 
-    async def open_upload_page(self, page: Page) -> None:
+    async def open_upload_page(self, page: Page) -> bool:
         await page.goto(TENCENT_UPLOAD_URL, wait_until="domcontentloaded")
         await page.wait_for_timeout(1500)
+
+        login_performed = False
         if not _is_tencent_authenticated_url(page.url):
-            raise RuntimeError(f"视频号登录态已失效或被打回登录页: {page.url}")
+            if self.headless:
+                raise RuntimeError(f"视频号登录态已失效或被打回登录页: {page.url}")
+
+            login_performed = True
+            tencent_logger.info(_msg("🧍", "请在当前浏览器扫码；登录后小人会直接继续发布，不会关闭重开"))
+            for _ in range(300):
+                if _is_tencent_authenticated_url(page.url):
+                    break
+                await page.wait_for_timeout(1000)
+            else:
+                raise RuntimeError("等待视频号扫码登录超时")
+
+            tencent_logger.success(_msg("🥳", "扫码登录成功，继续使用当前浏览器发布"))
+            if not page.url.startswith(TENCENT_UPLOAD_URL):
+                await page.goto(TENCENT_UPLOAD_URL, wait_until="domcontentloaded")
+
         await page.wait_for_url(TENCENT_UPLOAD_URL, timeout=30000)
+        return login_performed
 
     async def upload_video_file(self, page: Page, file_path: str) -> None:
         await _set_tencent_video_file(page, file_path)
@@ -848,11 +911,17 @@ class TencentVideo(TencentBaseUploader):
         tencent_logger.info(_msg("🥳", "上传前检查通过"))
 
         browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
-        context = await browser.new_context(storage_state=self.account_file)
+        context_options = {}
+        if os.path.exists(self.account_file):
+            context_options["storage_state"] = self.account_file
+        context = await browser.new_context(**context_options)
 
         try:
             page = await context.new_page()
-            await self.open_upload_page(page)
+            login_performed = await self.open_upload_page(page)
+            if login_performed:
+                await context.storage_state(path=self.account_file)
+                tencent_logger.success(_msg("🥳", "登录状态已保存，当前浏览器继续发布"))
             tencent_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}"))
 
             await self.upload_video_file(page, self.file_path)

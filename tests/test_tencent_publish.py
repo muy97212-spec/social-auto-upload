@@ -95,6 +95,52 @@ class TencentCookieAuthTests(unittest.TestCase):
             )
         )
 
+    def test_platform_landing_url_is_authenticated(self):
+        self.assertTrue(
+            tencent_main._is_tencent_authenticated_url(
+                "https://channels.weixin.qq.com/platform"
+            )
+        )
+
+
+class FakeInteractiveLoginPage:
+    def __init__(self):
+        self.url = "https://channels.weixin.qq.com/login.html"
+        self.goto_calls = []
+        self.wait_count = 0
+
+    async def goto(self, url, **kwargs):
+        self.goto_calls.append(url)
+        if len(self.goto_calls) > 1:
+            self.url = url
+
+    async def wait_for_timeout(self, timeout):
+        self.wait_count += 1
+        if self.wait_count == 2:
+            self.url = "https://channels.weixin.qq.com/platform"
+
+    async def wait_for_url(self, url, **kwargs):
+        self.waited_url = url
+
+
+class TencentInlineLoginTests(unittest.IsolatedAsyncioTestCase):
+    async def test_headed_upload_waits_for_login_and_reuses_same_page(self):
+        uploader = tencent_main.TencentBaseUploader(
+            publish_date=0,
+            account_file="/tmp/tencent-test.json",
+            headless=False,
+        )
+        page = FakeInteractiveLoginPage()
+
+        login_performed = await uploader.open_upload_page(page)
+
+        self.assertTrue(login_performed)
+        self.assertEqual(
+            page.goto_calls,
+            [tencent_main.TENCENT_UPLOAD_URL, tencent_main.TENCENT_UPLOAD_URL],
+        )
+        self.assertEqual(page.waited_url, tencent_main.TENCENT_UPLOAD_URL)
+
 
 if __name__ == "__main__":
     unittest.main()
