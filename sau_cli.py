@@ -54,6 +54,7 @@ class DouyinVideoUploadRequest:
     tags: list[str]
     publish_date: datetime | int
     thumbnail_file: Path | None = None
+    thumbnail_landscape_file: Path | None = None
     product_link: str = ""
     product_title: str = ""
     publish_strategy: str = DOUYIN_PUBLISH_STRATEGY_IMMEDIATE
@@ -137,6 +138,7 @@ class BilibiliVideoUploadRequest:
     tid: int
     tags: list[str]
     publish_date: datetime | int
+    thumbnail_file: Path | None = None
 
 
 @dataclass(slots=True)
@@ -285,6 +287,7 @@ async def upload_video(request: DouyinVideoUploadRequest) -> Path:
         request.publish_date,
         str(account_file),
         desc=request.description,
+        thumbnail_landscape_path=str(request.thumbnail_landscape_file) if request.thumbnail_landscape_file else None,
         thumbnail_portrait_path=str(request.thumbnail_file) if request.thumbnail_file else None,
         productLink=request.product_link,
         productTitle=request.product_title,
@@ -433,6 +436,8 @@ async def upload_bilibili_video(request: BilibiliVideoUploadRequest) -> Path:
         "--tid",
         str(request.tid),
     ]
+    if request.thumbnail_file:
+        arguments.extend(["--cover", str(request.thumbnail_file)])
     if request.tags:
         arguments.extend(["--tag", ",".join(request.tags)])
     if isinstance(request.publish_date, datetime):
@@ -520,7 +525,8 @@ def build_parser() -> argparse.ArgumentParser:
     upload_video_parser.add_argument("--desc", default="", help="Optional video description")
     upload_video_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
     upload_video_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
-    upload_video_parser.add_argument("--thumbnail", type=existing_file_path, help="Optional thumbnail path")
+    upload_video_parser.add_argument("--thumbnail", type=existing_file_path, help="Optional thumbnail path (竖版 3:4)")
+    upload_video_parser.add_argument("--thumbnail-landscape", type=existing_file_path, help="Optional landscape thumbnail (横版 4:3)")
     upload_video_parser.add_argument("--product-link", default="", help="Optional product link")
     upload_video_parser.add_argument("--product-title", default="", help="Optional product title")
     add_runtime_flags(upload_video_parser)
@@ -604,6 +610,7 @@ def build_parser() -> argparse.ArgumentParser:
     bilibili_upload_video_parser.add_argument("--desc", required=True, help="Video description")
     bilibili_upload_video_parser.add_argument("--tid", required=True, type=int, help="Bilibili category id")
     bilibili_upload_video_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
+    bilibili_upload_video_parser.add_argument("--thumbnail", type=existing_file_path, help="Optional cover image path (横版 16:9)")
     bilibili_upload_video_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
 
     tencent_parser = platform_parsers.add_parser("tencent", help="Tencent/WeChat Channels operations")
@@ -655,6 +662,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 tags=parse_tags(args.tags),
                 publish_date=args.schedule or 0,
                 thumbnail_file=args.thumbnail,
+                thumbnail_landscape_file=args.thumbnail_landscape,
                 product_link=args.product_link,
                 product_title=args.product_title,
                 publish_strategy=publish_strategy,
@@ -807,6 +815,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 tid=args.tid,
                 tags=parse_tags(args.tags),
                 publish_date=args.schedule or 0,
+                thumbnail_file=args.thumbnail,
             )
             await upload_bilibili_video(request)
             print(f"Bilibili video upload submitted: {request.video_file}")
