@@ -840,6 +840,41 @@ class TencentVideo(TencentBaseUploader):
         await page.get_by_role("button", name="删除", exact=True).click()
         await self.upload_video_file(page, self.file_path)
 
+    async def _log_cover_entry_diagnostics(self, page: Page) -> None:
+        """封面入口一个都没点中时，记下页面上实际有哪些封面区块，方便对照选择器。"""
+        try:
+            wraps = page.locator("div.vertical-cover-wrap")
+            count = await wraps.count()
+            tencent_logger.info(_msg("🔍", f"[封面诊断] 没点中任何封面入口；页面上 div.vertical-cover-wrap 有 {count} 个"))
+            for i in range(min(count, 5)):
+                text = " ".join((await wraps.nth(i).inner_text()).split())[:60]
+                tencent_logger.info(_msg("🔍", f"[封面诊断]   cover-wrap[{i}]: {text!r}"))
+            if not count:
+                hints = page.locator(':text("封面"), :text("个人主页卡片")')
+                hint_count = await hints.count()
+                tencent_logger.info(_msg("🔍", f"[封面诊断] 含「封面/个人主页卡片」字样的元素 {hint_count} 个"))
+                for i in range(min(hint_count, 5)):
+                    el = hints.nth(i)
+                    cls = await el.get_attribute("class") or ""
+                    text = " ".join((await el.inner_text()).split())[:40]
+                    tencent_logger.info(_msg("🔍", f"[封面诊断]   hint[{i}] class={cls!r} text={text!r}"))
+        except Exception as exc:
+            tencent_logger.info(_msg("🔍", f"[封面诊断] 收集封面入口信息失败: {exc}"))
+
+    async def _log_visible_dialogs(self, page: Page) -> None:
+        """找不到「编辑个人主页卡片」弹窗时，列出当前所有弹窗的开头文字，看是不是改名了。"""
+        try:
+            dialogs = page.locator("div.weui-desktop-dialog")
+            count = await dialogs.count()
+            tencent_logger.info(_msg("🔍", f"[封面诊断] 页面上 div.weui-desktop-dialog 共 {count} 个"))
+            for i in range(min(count, 8)):
+                dialog = dialogs.nth(i)
+                visible = await dialog.is_visible()
+                text = " ".join((await dialog.inner_text()).split())[:40] if visible else ""
+                tencent_logger.info(_msg("🔍", f"[封面诊断]   dialog[{i}] visible={visible} text={text!r}"))
+        except Exception as exc:
+            tencent_logger.info(_msg("🔍", f"[封面诊断] 收集弹窗信息失败: {exc}"))
+
     async def set_thumbnail(self, page: Page) -> None:
         if not self.thumbnail_path:
             return
@@ -851,6 +886,7 @@ class TencentVideo(TencentBaseUploader):
             'div.vertical-cover-wrap:has-text("3:4")',
             'div.vertical-cover-wrap:has-text("个人主页卡片")',
         ]
+        clicked_selector = None
         for selector in cover_entry_selectors:
             cover_entry = page.locator(selector).first
             try:
@@ -859,12 +895,20 @@ class TencentVideo(TencentBaseUploader):
                 await cover_entry.wait_for(state="visible", timeout=3000)
                 await cover_entry.click()
                 await page.wait_for_timeout(500)
+                clicked_selector = selector
                 break
-            except Exception:
+            except Exception as exc:
+                tencent_logger.info(_msg("🔍", f"[封面诊断] 入口 {selector} 点击失败: {exc}"))
                 continue
+
+        if clicked_selector:
+            tencent_logger.info(_msg("🔍", f"[封面诊断] 点中封面入口: {clicked_selector}"))
+        else:
+            await self._log_cover_entry_diagnostics(page)
 
         cover_dialog = page.locator("div.weui-desktop-dialog").filter(has_text="编辑个人主页卡片").first
         if not await cover_dialog.count():
+            await self._log_visible_dialogs(page)
             tencent_logger.info(_msg("🧍", "当前页面没有出现封面编辑弹窗，小人先跳过自定义封面"))
             return
 
