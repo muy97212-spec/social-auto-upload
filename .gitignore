@@ -193,3 +193,6 @@ videoFile
 # 运行期调试产物（视频号声明原创诊断截图、登录二维码等）
 /debug_*.png
 /qrcode.png
+
+# 抖音封面诊断截图
+logs/*.png

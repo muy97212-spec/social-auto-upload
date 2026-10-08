@@ -466,6 +466,39 @@ class DouYinVideo(DouYinBaseUploader):
                     douyin_logger.warning(_msg("😵", f"推荐封面没选成功: {e}"))
         return False
 
+    async def _switch_cover_tab(self, page: Page, cover_locator, tab_text: str) -> None:
+        tab = cover_locator.get_by_text(tab_text, exact=True).first
+        try:
+            await tab.click(timeout=3000)
+            await page.wait_for_timeout(800)
+            douyin_logger.info(_msg("🔍", f"[封面诊断] 已切到「{tab_text}」"))
+        except Exception as exc:
+            douyin_logger.warning(_msg("😵", f"[封面诊断] 没点到「{tab_text}」，封面可能放错位置: {exc}"))
+
+    async def _log_cover_modal_diagnostics(self, cover_locator) -> None:
+        try:
+            steps = cover_locator.locator("div[class*='steps'] div")
+            texts = []
+            for i in range(min(await steps.count(), 6)):
+                text = " ".join((await steps.nth(i).inner_text()).split())
+                if text:
+                    texts.append(text)
+            inputs = await cover_locator.locator("input.semi-upload-hidden-input").count()
+            douyin_logger.info(_msg("🔍", f"[封面诊断] 弹窗 tab: {texts}；上传 input 共 {inputs} 个"))
+        except Exception as exc:
+            douyin_logger.info(_msg("🔍", f"[封面诊断] 收集弹窗信息失败: {exc}"))
+
+    async def _screenshot_cover_modal(self, page: Page, cover_locator, tag: str) -> None:
+        """上传后截一张弹窗图，事后能直接看预览里是不是那张封面。"""
+        try:
+            out_dir = Path(__file__).resolve().parents[2] / "logs"
+            out_dir.mkdir(exist_ok=True)
+            out = out_dir / f"douyin_cover_{tag}_{datetime.now():%Y%m%d_%H%M%S}.png"
+            await cover_locator.screenshot(path=str(out))
+            douyin_logger.info(_msg("🔍", f"[封面诊断] 弹窗截图: {out}"))
+        except Exception as exc:
+            douyin_logger.info(_msg("🔍", f"[封面诊断] 弹窗截图失败: {exc}"))
+
     async def set_thumbnail(self, page: Page):
         if not self.thumbnail_landscape_path and not self.thumbnail_portrait_path:
             return
@@ -476,20 +509,36 @@ class DouYinVideo(DouYinBaseUploader):
         cover_locator = page.locator(cover_locator_str)
         await page.wait_for_selector(cover_locator_str)
 
-        upload_input = cover_locator.locator("div[class^='semi-upload upload'] >> input.semi-upload-hidden-input")
+        await page.wait_for_timeout(1000)
+        await self._log_cover_modal_diagnostics(cover_locator)
+
+        # 弹窗里有两个上传 input：左侧「AI 封面参考图」和帧选择区「上传封面」。
+        # 旧写法可能取到前者，图进了参考图槽、真封面没换（上游 PR #264 F12 实测）。
+        # 按「点击上传文件…」拖拽区精确定位真正的封面上传 input，取不到再 .last 兜底。
+        upload_input = cover_locator.locator(
+            ".semi-upload:has(.semi-upload-drag-area-main-text) input.semi-upload-hidden-input"
+        ).first
+        if await upload_input.count():
+            douyin_logger.info(_msg("🔍", "[封面诊断] 上传 input：按拖拽区文字定位"))
+        else:
+            upload_input = cover_locator.locator("input.semi-upload-hidden-input").last
+            douyin_logger.info(_msg("🔍", "[封面诊断] 上传 input：拖拽区没找到，回退取最后一个"))
+
+        # 弹窗默认停在「设置竖封面」页（上游注释），旧代码当成横封面在前，导致横竖互换。
+        # 改为按文字点对应 tab，不再按顺序猜。
+        if self.thumbnail_portrait_path:
+            await self._switch_cover_tab(page, cover_locator, "设置竖封面")
+            await upload_input.set_input_files(self.thumbnail_portrait_path)
+            await page.wait_for_timeout(3000)
+            douyin_logger.info(_msg("🖼️", "竖版封面上传完成"))
+            await self._screenshot_cover_modal(page, cover_locator, "portrait")
 
         if self.thumbnail_landscape_path:
-            await page.wait_for_timeout(1000)
+            await self._switch_cover_tab(page, cover_locator, "设置横封面")
             await upload_input.set_input_files(self.thumbnail_landscape_path)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(3000)
             douyin_logger.info(_msg("🖼️", "横版封面上传完成"))
-
-        if self.thumbnail_portrait_path:
-            await cover_locator.locator("div[class*='steps'] div").nth(1).click()
-            await page.wait_for_timeout(1000)
-            await upload_input.set_input_files(self.thumbnail_portrait_path)
-            await page.wait_for_timeout(2000)
-            douyin_logger.info(_msg("🖼️", "竖版封面上传完成"))
+            await self._screenshot_cover_modal(page, cover_locator, "landscape")
 
         await cover_locator.locator('button:visible:has-text("完成")').click()
         douyin_logger.info(_msg("🥳", "视频封面设置完成"))
