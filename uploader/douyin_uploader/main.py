@@ -499,15 +499,34 @@ class DouYinVideo(DouYinBaseUploader):
         except Exception as exc:
             douyin_logger.info(_msg("🔍", f"[封面诊断] 弹窗截图失败: {exc}"))
 
+    async def _open_cover_modal(self, page: Page, cover_locator_str: str) -> None:
+        # 页面上「选择封面」有 2 个（第 1 个是区块标题）。描述里话题多时，话题标签浮层会盖在标题上拦截点击，
+        # 原来的 page.click 会卡满 30 秒超时（2026-10-09 实测）。逐个候选试，普通点击被拦就 dispatch_event 绕过命中检测。
+        candidates = page.get_by_text("选择封面", exact=True)
+        count = await candidates.count()
+        douyin_logger.info(_msg("🔍", f"[封面诊断] 「选择封面」候选 {count} 个"))
+        for i in range(count):
+            for how in ("click", "dispatch"):
+                try:
+                    if how == "click":
+                        await candidates.nth(i).click(timeout=3000)
+                    else:
+                        await candidates.nth(i).dispatch_event("click")
+                    await page.wait_for_selector(cover_locator_str, timeout=5000)
+                    douyin_logger.info(_msg("🔍", f"[封面诊断] 封面弹窗已打开（第 {i + 1} 个候选，{how}）"))
+                    return
+                except Exception:
+                    continue
+        raise RuntimeError("封面弹窗打不开：所有「选择封面」候选都点不开")
+
     async def set_thumbnail(self, page: Page):
         if not self.thumbnail_landscape_path and not self.thumbnail_portrait_path:
             return
 
         douyin_logger.info(_msg("🏃", "小人正在设置视频封面"))
-        await page.click('text="选择封面"')
         cover_locator_str = 'div[id*="creator-content-modal"]'
         cover_locator = page.locator(cover_locator_str)
-        await page.wait_for_selector(cover_locator_str)
+        await self._open_cover_modal(page, cover_locator_str)
 
         await page.wait_for_timeout(1000)
         await self._log_cover_modal_diagnostics(cover_locator)
