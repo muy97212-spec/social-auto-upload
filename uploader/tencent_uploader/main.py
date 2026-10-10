@@ -875,6 +875,44 @@ class TencentVideo(TencentBaseUploader):
         except Exception as exc:
             tencent_logger.info(_msg("🔍", f"[封面诊断] 收集弹窗信息失败: {exc}"))
 
+    async def _find_cover_file_input(self, cover_dialog):
+        """按优先级找「上传封面」那个 file input；顺带把弹窗里所有 file input 记进日志。"""
+        try:
+            inputs = cover_dialog.locator('input[type="file"]')
+            count = await inputs.count()
+            accepts = [await inputs.nth(i).get_attribute("accept") for i in range(min(count, 6))]
+            tencent_logger.info(_msg("🔍", f"[封面诊断] 弹窗内 file input 共 {count} 个，accept={accepts}"))
+        except Exception as exc:
+            tencent_logger.info(_msg("🔍", f"[封面诊断] 收集 file input 失败: {exc}"))
+        candidates = [
+            ('.single-cover-uploader-wrap input[type="file"]', "single-cover-uploader-wrap"),
+            ('input[type="file"][accept*="image"]', "accept=image"),
+            ('input[type="file"]', "弹窗内第一个 file input"),
+        ]
+        for selector, label in candidates:
+            file_input = cover_dialog.locator(selector).first
+            if await file_input.count():
+                tencent_logger.info(_msg("🔍", f"[封面诊断] 上传 input 定位方式: {label}"))
+                return file_input
+        return None
+
+    async def _cancel_cover_dialog(self, cover_dialog) -> None:
+        try:
+            await cover_dialog.locator('button:visible:has-text("取消")').last.click(timeout=3000)
+        except Exception:
+            pass
+
+    async def _screenshot_cover_dialog(self, cover_dialog) -> None:
+        """点「确认」前截一张弹窗图，事后能直接看预览里是不是那张封面。"""
+        try:
+            out_dir = Path(BASE_DIR) / "logs"
+            out_dir.mkdir(exist_ok=True)
+            out = out_dir / f"tencent_cover_{datetime.now():%Y%m%d_%H%M%S}.png"
+            await cover_dialog.screenshot(path=str(out))
+            tencent_logger.info(_msg("🔍", f"[封面诊断] 弹窗截图: {out}"))
+        except Exception as exc:
+            tencent_logger.info(_msg("🔍", f"[封面诊断] 弹窗截图失败: {exc}"))
+
     async def set_thumbnail(self, page: Page) -> None:
         if not self.thumbnail_path:
             return
@@ -906,42 +944,60 @@ class TencentVideo(TencentBaseUploader):
         else:
             await self._log_cover_entry_diagnostics(page)
 
-        cover_dialog = page.locator("div.weui-desktop-dialog").filter(has_text="编辑个人主页卡片").first
-        if not await cover_dialog.count():
+        # 2026-10 视频号改版：弹窗标题从「编辑个人主页卡片」改成「编辑封面」（诊断日志实测）。
+        # 页面上常驻三十多个 hidden 的 weui-desktop-dialog，必须限定 :visible，否则 .first 会取到旧弹窗（上游 #262）。
+        cover_dialog = None
+        for title in ("编辑个人主页卡片", "编辑封面"):
+            candidate = page.locator("div.weui-desktop-dialog:visible").filter(has_text=title).first
+            try:
+                await candidate.wait_for(state="visible", timeout=3000)
+            except Exception:
+                continue
+            cover_dialog = candidate
+            tencent_logger.info(_msg("🔍", f"[封面诊断] 匹配到封面弹窗: {title}"))
+            break
+
+        if cover_dialog is None:
             await self._log_visible_dialogs(page)
             tencent_logger.info(_msg("🧍", "当前页面没有出现封面编辑弹窗，小人先跳过自定义封面"))
             return
 
-        try:
-            await cover_dialog.wait_for(state="visible", timeout=5000)
-        except Exception:
-            tencent_logger.warning(_msg("😵", "封面编辑弹窗暂时不可见，这次先跳过自定义封面"))
+        file_input = await self._find_cover_file_input(cover_dialog)
+        if file_input is None:
+            tencent_logger.warning(_msg("😵", "封面弹窗里找不到上传 input，这次先跳过自定义封面"))
+            await self._cancel_cover_dialog(cover_dialog)
             return
-
-        file_input = cover_dialog.locator('.single-cover-uploader-wrap input[type="file"]').first
-        await file_input.wait_for(state="attached", timeout=10000)
         await file_input.set_input_files(self.thumbnail_path)
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(2000)
 
-        crop_dialog = page.locator("div.weui-desktop-dialog").filter(has_text="裁剪封面图").first
-        if await crop_dialog.count():
-            try:
-                await crop_dialog.wait_for(state="visible", timeout=10000)
-                crop_confirm_button = crop_dialog.locator(
-                    'div.weui-desktop-dialog__ft button.weui-desktop-btn_primary:has-text("确定")'
-                ).first
-                if await crop_confirm_button.count():
-                    await crop_confirm_button.wait_for(state="visible", timeout=5000)
-                    await crop_confirm_button.click()
-                    await page.wait_for_timeout(1000)
-            except Exception as exc:
-                tencent_logger.warning(_msg("😵", f"封面裁剪确认时出错，小人继续尝试保存主弹窗: {exc}"))
+        # 图不是 3:4 时才会弹「裁剪封面图」。页面上常驻一个 hidden 的同名弹窗（「确定」按钮也是 hidden），
+        # 所以只认可见的「确定」按钮；没有就说明不需要裁剪，直接往下走（2026-10-09 实测，原写法白等 5 秒再报警告）。
+        crop_confirm_button = page.locator(
+            'div.weui-desktop-dialog:has-text("裁剪封面图") div.weui-desktop-dialog__ft '
+            'button.weui-desktop-btn_primary:visible:has-text("确定")'
+        ).first
+        try:
+            await crop_confirm_button.wait_for(state="visible", timeout=2000)
+            await crop_confirm_button.click()
+            await page.wait_for_timeout(1000)
+            tencent_logger.info(_msg("🔍", "[封面诊断] 已确认裁剪封面图"))
+        except Exception:
+            pass
+
+        await self._screenshot_cover_dialog(cover_dialog)
 
         confirm_button = cover_dialog.locator(
             'div.weui-desktop-dialog__ft button.weui-desktop-btn_primary:has-text("确认")'
         ).first
+        if not await confirm_button.count():
+            confirm_button = cover_dialog.locator('button:visible:has-text("确认")').last
         await confirm_button.wait_for(state="visible", timeout=10000)
         await confirm_button.click()
+        try:
+            await cover_dialog.wait_for(state="hidden", timeout=10000)
+        except Exception:
+            tencent_logger.warning(_msg("😵", "[封面诊断] 点了「确认」但封面弹窗没关，封面可能没保存"))
+            return
         tencent_logger.success(_msg("🥳", "封面已经设置完成"))
 
     async def prepare_video_for_publish(self, page: Page) -> None:
