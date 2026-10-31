@@ -4,6 +4,7 @@ from datetime import datetime
 import asyncio
 import inspect
 import os
+import re
 from pathlib import Path
 
 from patchright.async_api import Page
@@ -219,6 +220,10 @@ async def douyin_cookie_gen(
         return result
 
 
+
+# 抖音「自主声明」弹窗里的 AI 选项。UI 文案 AI 两侧有没有空格没核实，用正则兼容。
+DOUYIN_AI_DECLARATION = re.compile(r"内容由\s*AI\s*生成")
+
 class DouYinBaseUploader(BaseVideoUploader):
     def __init__(
         self,
@@ -367,8 +372,11 @@ class DouYinBaseUploader(BaseVideoUploader):
             douyin_logger.error(_msg("😢", f"设置商品链接时出错: {str(e)}"))
             return False
 
-    async def set_self_declaration(self, page: Page, declaration: str = "内容为个人观点或见解") -> None:
+    async def set_self_declaration(self, page: Page, declaration: str | re.Pattern = DOUYIN_AI_DECLARATION) -> None:
         """抖音「自主声明」为发布必选项：打开声明弹窗 → 选指定类型 → 确定。
+
+        默认选「内容由AI生成」：配音是克隆 TTS、画面是代码生成，按《标识办法》第十条和抖音
+        2026-05《内容标识使用规范》要主动声明（2026-10-30 起；之前选的是「内容为个人观点或见解」）。
 
         入口和弹窗都是异步渲染，等不到就记 warning 跳过、继续发布，绝不因此中断
         （与小红书话题、视频号声明原创的容错策略保持一致）。
@@ -389,10 +397,12 @@ class DouYinBaseUploader(BaseVideoUploader):
             if await option.count():
                 await option.click(timeout=6000)
             else:
-                await dialog.get_by_text(declaration, exact=True).first.click(timeout=6000, force=True)
+                exact = None if isinstance(declaration, re.Pattern) else True
+                await dialog.get_by_text(declaration, exact=exact).first.click(timeout=6000, force=True)
             await dialog.get_by_role("button", name="确定").click(timeout=6000)
             await dialog.wait_for(state="hidden", timeout=6000)
-            douyin_logger.info(_msg("🧾", f"自主声明已选择「{declaration}」"))
+            label = declaration.pattern if isinstance(declaration, re.Pattern) else declaration
+            douyin_logger.info(_msg("🧾", f"自主声明已选择「{label}」"))
         except Exception as exc:
             douyin_logger.warning(_msg("🧾", f"自主声明设置失败，跳过该步骤继续发布：{exc}"))
 
